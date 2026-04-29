@@ -100,6 +100,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sidebar.on_chat_selected = self._open_chat
         self._sidebar.on_new_chat = self._create_new_chat
         self._sidebar.on_delete_chat = self._confirm_delete_chat
+        self._sidebar.on_rename_chat = self._do_rename_chat
 
         sidebar_page = Adw.NavigationPage(title="Chats")
         sidebar_page.set_child(self._sidebar)
@@ -255,6 +256,16 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.connect("response", lambda d, r: self._do_delete_chat(chat_id) if r == "delete" else None)
         dialog.present()
+
+    def _do_rename_chat(self, chat_id: str, new_title: str):
+        chat = ChatStore.load_chat(chat_id)
+        if chat:
+            chat.title = new_title
+            ChatStore.save_chat(chat)
+            self._sidebar.update_chat_title(chat_id, new_title)
+            if self._chat and self._chat.id == chat_id:
+                self._chat.title = new_title
+                self._title_label.set_label(new_title)
 
     def _do_delete_chat(self, chat_id: str):
         ChatStore.delete_chat(chat_id)

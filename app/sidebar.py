@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 
 
 def _format_date(iso: str) -> str:
-    """Return a human-friendly date string relative to now."""
     try:
         dt = datetime.fromisoformat(iso)
         now = datetime.now(timezone.utc)
@@ -38,9 +37,11 @@ def _format_date(iso: str) -> str:
 class ChatRow(Gtk.ListBoxRow):
     """A single row in the sidebar list."""
 
-    def __init__(self, chat: Chat):
+    def __init__(self, chat: Chat, on_delete, on_rename):
         super().__init__()
         self.chat_id = chat.id
+        self._on_delete = on_delete
+        self._on_rename = on_rename
         self._build(chat)
 
     def _build(self, chat: Chat):
@@ -63,27 +64,66 @@ class ChatRow(Gtk.ListBoxRow):
 
         date_lbl = Gtk.Label(label=_format_date(chat.last_updated()))
         date_lbl.set_xalign(0)
-        date_lbl.add_css_class("dim-label")
         date_lbl.set_css_classes(["caption", "dim-label"])
         text_box.append(date_lbl)
 
-        # Context menu button
+        # Context menu button — plain Gtk.Button with a Popover
         menu_btn = Gtk.MenuButton()
         menu_btn.set_icon_name("view-more-symbolic")
         menu_btn.add_css_class("flat")
         menu_btn.set_valign(Gtk.Align.CENTER)
         box.append(menu_btn)
 
-        menu = Gtk.PopoverMenu.new_from_model(self._build_menu())
-        menu_btn.set_popover(menu)
+        # Build popover with real buttons instead of Gio.Menu actions
+        pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        pop_box.set_margin_top(4)
+        pop_box.set_margin_bottom(4)
+        pop_box.set_margin_start(4)
+        pop_box.set_margin_end(4)
 
-    def _build_menu(self) -> Gtk.Menu:
-        #menu = Gtk.Menu.new()  # will use Gio.Menu instead
-        from gi.repository import Gio
-        gm = Gio.Menu()
-        gm.append("Rename", f"row.rename::{self.chat_id}")
-        gm.append("Delete", f"row.delete::{self.chat_id}")
-        return gm
+        rename_btn = Gtk.Button(label="Rename")
+        rename_btn.add_css_class("flat")
+        rename_btn.connect("clicked", self._do_rename, menu_btn)
+        pop_box.append(rename_btn)
+
+        delete_btn = Gtk.Button(label="Delete")
+        delete_btn.add_css_class("flat")
+        delete_btn.add_css_class("destructive-action")
+        delete_btn.connect("clicked", self._do_delete, menu_btn)
+        pop_box.append(delete_btn)
+
+        popover = Gtk.Popover()
+        popover.set_child(pop_box)
+        menu_btn.set_popover(popover)
+
+    def _do_delete(self, _btn, menu_btn):
+        menu_btn.get_popover().popdown()
+        if self._on_delete:
+            self._on_delete(self.chat_id)
+
+    def _do_rename(self, _btn, menu_btn):
+        menu_btn.get_popover().popdown()
+        # Show an inline rename dialog
+        dialog = Adw.MessageDialog(
+            transient_for=self.get_root(),
+            heading="Rename chat",
+        )
+        entry = Gtk.Entry()
+        entry.set_text(self._title_label.get_label())
+        entry.set_activates_default(True)
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("rename", "Rename")
+        dialog.set_response_appearance("rename", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("rename")
+        dialog.connect("response", self._on_rename_response, entry)
+        dialog.present()
+
+    def _on_rename_response(self, dialog, response, entry):
+        if response == "rename":
+            new_title = entry.get_text().strip()
+            if new_title and self._on_rename:
+                self._on_rename(self.chat_id, new_title)
 
     def update_title(self, title: str):
         self._title_label.set_label(title)
@@ -91,7 +131,7 @@ class ChatRow(Gtk.ListBoxRow):
 
 class Sidebar(Gtk.Box):
     """
-    The sidebar containing a New Chat button and a list of past conversations.
+    Sidebar: New Chat button + searchable list of past conversations.
     """
 
     def __init__(self):
@@ -102,17 +142,12 @@ class Sidebar(Gtk.Box):
         self.on_delete_chat = None
         self.on_rename_chat = None
 
-        self._rows: dict[str, ChatRow] = {}  # chat_id -> ChatRow
+        self._rows: dict[str, ChatRow] = {}
 
         self._build_ui()
         self.refresh()
 
-    # ------------------------------------------------------------------ #
-    # UI construction
-    # ------------------------------------------------------------------ #
-
     def _build_ui(self):
-        # Header
         header = Adw.HeaderBar()
         header.set_show_end_title_buttons(False)
         header.set_title_widget(Gtk.Label(label="Chats"))
@@ -123,7 +158,6 @@ class Sidebar(Gtk.Box):
         new_btn.connect("clicked", lambda _: self.on_new_chat and self.on_new_chat())
         header.pack_start(new_btn)
 
-        # Search bar
         self._search_entry = Gtk.SearchEntry()
         self._search_entry.set_placeholder_text("Search…")
         self._search_entry.set_margin_start(8)
@@ -133,7 +167,6 @@ class Sidebar(Gtk.Box):
         self._search_entry.connect("search-changed", self._on_search_changed)
         self.append(self._search_entry)
 
-        # Scrollable list
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -153,8 +186,6 @@ class Sidebar(Gtk.Box):
     # ------------------------------------------------------------------ #
 
     def refresh(self):
-        """Reload all chats from disk and rebuild the list."""
-        # Remove existing rows
         child = self._list_box.get_first_child()
         while child:
             nxt = child.get_next_sibling()
@@ -163,12 +194,9 @@ class Sidebar(Gtk.Box):
         self._rows.clear()
 
         for chat in ChatStore.list_chats():
-            row = ChatRow(chat)
-            self._list_box.append(row)
-            self._rows[chat.id] = row
+            self._append_row(chat)
 
     def select_chat(self, chat_id: str):
-        """Highlight the row for the given chat."""
         row = self._rows.get(chat_id)
         if row:
             self._list_box.select_row(row)
@@ -178,9 +206,8 @@ class Sidebar(Gtk.Box):
         if row:
             row.update_title(title)
 
-    def prepend_chat(self, chat):
-        """Add a newly created chat to the top of the list."""
-        row = ChatRow(chat)
+    def prepend_chat(self, chat: Chat):
+        row = ChatRow(chat, self._handle_delete, self._handle_rename)
         self._list_box.prepend(row)
         self._rows[chat.id] = row
         self._list_box.select_row(row)
@@ -191,8 +218,21 @@ class Sidebar(Gtk.Box):
             self._list_box.remove(row)
 
     # ------------------------------------------------------------------ #
-    # Event handlers
+    # Internal
     # ------------------------------------------------------------------ #
+
+    def _append_row(self, chat: Chat):
+        row = ChatRow(chat, self._handle_delete, self._handle_rename)
+        self._list_box.append(row)
+        self._rows[chat.id] = row
+
+    def _handle_delete(self, chat_id: str):
+        if self.on_delete_chat:
+            self.on_delete_chat(chat_id)
+
+    def _handle_rename(self, chat_id: str, new_title: str):
+        if self.on_rename_chat:
+            self.on_rename_chat(chat_id, new_title)
 
     def _on_row_activated(self, _lb, row: ChatRow):
         if self.on_chat_selected:
