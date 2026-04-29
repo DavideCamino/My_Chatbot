@@ -1,86 +1,179 @@
 """
 ChatView — the right-hand message area.
 
-User bubbles: plain Gtk.Label (right-aligned).
-Assistant bubbles: WebKit2 WebView rendering markdown as HTML (full width).
+User bubbles:     plain Gtk.Label (right-aligned).
+Assistant bubbles: Gtk.TextView with Pango markup rendered from markdown.
+                   Full-width, stable during streaming, no WebKit needed.
 
-Dependencies (system packages):
-  gir1.2-webkit2-4.1  (or webkit2gtk-4.1 on Fedora/Arch)
-  python3-mistune      OR  pip install mistune
+Extra dependency: pip install mistune
 """
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-gi.require_version("WebKit", "6.0")   # WebKitGTK 6 (GTK4)
-from gi.repository import Gtk, Adw, Gdk, GLib, Pango, WebKit
+from gi.repository import Gtk, Adw, Gdk, GLib, Pango
 
-import mistune   # pip install mistune
+import html as _html
+import re
 
 from app.chat_store import Chat, Message
 
 
-# ── Markdown → HTML ────────────────────────────────────────────────────────
+# ── Markdown → Pango markup ────────────────────────────────────────────────
+# We do a lightweight manual conversion rather than mistune so there are
+# zero extra dependencies and the result maps cleanly to Pango tags.
 
-_md = mistune.create_markdown(plugins=["strikethrough", "table", "task_lists"])
+def _md_to_pango(text: str) -> str:
+    """
+    Convert a small but practical subset of Markdown to Pango markup.
+    Handles: headings, bold, italic, inline code, code blocks,
+             unordered lists, ordered lists, blockquotes, horizontal rules.
+    """
+    lines = text.split("\n")
+    out = []
+    in_code_block = False
+    code_buf = []
+    i = 0
 
-# Minimal CSS injected into every WebView so it matches the GNOME theme
-_CSS_LIGHT = """
-body { font-family: sans-serif; font-size: 15px; line-height: 1.6;
-       color: #1a1a1a; background: transparent; margin: 0; padding: 4px 0; }
-code, pre { font-family: monospace; background: #f0f0f0;
-            border-radius: 4px; font-size: 13px; }
-pre { padding: 10px; overflow-x: auto; }
-code { padding: 2px 5px; }
-blockquote { border-left: 3px solid #aaa; margin: 0; padding-left: 12px; color: #555; }
-table { border-collapse: collapse; width: 100%; }
-td, th { border: 1px solid #ccc; padding: 4px 8px; }
-th { background: #f5f5f5; }
-a { color: #1c6ea4; }
-p:first-child { margin-top: 0; } p:last-child { margin-bottom: 0; }
-"""
+    while i < len(lines):
+        line = lines[i]
 
-_CSS_DARK = """
-body { font-family: sans-serif; font-size: 15px; line-height: 1.6;
-       color: #e0e0e0; background: transparent; margin: 0; padding: 4px 0; }
-code, pre { font-family: monospace; background: #2a2a2a;
-            border-radius: 4px; font-size: 13px; }
-pre { padding: 10px; overflow-x: auto; }
-code { padding: 2px 5px; }
-blockquote { border-left: 3px solid #666; margin: 0; padding-left: 12px; color: #aaa; }
-table { border-collapse: collapse; width: 100%; }
-td, th { border: 1px solid #555; padding: 4px 8px; }
-th { background: #333; }
-a { color: #6aaddb; }
-p:first-child { margin-top: 0; } p:last-child { margin-bottom: 0; }
-"""
+        # ── fenced code block ──────────────────────────────────────
+        if line.startswith("```"):
+            if not in_code_block:
+                in_code_block = True
+                code_buf = []
+            else:
+                in_code_block = False
+                code = "\n".join(code_buf)
+                escaped = _html.escape(code)
+                out.append(
+                    f'<span font_family="monospace" size="small" '
+                    f'background="#2a2a2a" foreground="#e0e0e0"> {escaped} </span>'
+                )
+            i += 1
+            continue
+
+        if in_code_block:
+            code_buf.append(line)
+            i += 1
+            continue
+
+        # ── headings ───────────────────────────────────────────────
+        m = re.match(r"^(#{1,3})\s+(.*)", line)
+        if m:
+            level = len(m.group(1))
+            sizes = {1: "x-large", 2: "large", 3: "medium"}
+            content = _inline_md(m.group(2))
+            out.append(f'<span size="{sizes[level]}" weight="bold">{content}</span>')
+            i += 1
+            continue
+
+        # ── horizontal rule ────────────────────────────────────────
+        if re.match(r"^[-*_]{3,}\s*$", line):
+            out.append('<span foreground="#888">────────────────────</span>')
+            i += 1
+            continue
+
+        # ── blockquote ─────────────────────────────────────────────
+        if line.startswith("> "):
+            content = _inline_md(line[2:])
+            out.append(f'<span foreground="#888">┃ {content}</span>')
+            i += 1
+            continue
+
+        # ── unordered list ─────────────────────────────────────────
+        m = re.match(r"^[\-\*\+]\s+(.*)", line)
+        if m:
+            content = _inline_md(m.group(1))
+            out.append(f"  • {content}")
+            i += 1
+            continue
+
+        # ── ordered list ───────────────────────────────────────────
+        m = re.match(r"^(\d+)\.\s+(.*)", line)
+        if m:
+            content = _inline_md(m.group(2))
+            out.append(f"  {m.group(1)}. {content}")
+            i += 1
+            continue
+
+        # ── blank line ─────────────────────────────────────────────
+        if line.strip() == "":
+            out.append("")
+            i += 1
+            continue
+
+        # ── normal paragraph line ──────────────────────────────────
+        out.append(_inline_md(line))
+        i += 1
+
+    return "\n".join(out)
 
 
-def _is_dark() -> bool:
-    """Detect whether the system is using a dark colour scheme."""
-    style = Gtk.Settings.get_default()
-    return style.get_property("gtk-application-prefer-dark-theme")
+def _inline_md(text: str) -> str:
+    """Apply inline markdown (bold, italic, inline code) to a single line."""
+    # Escape XML special chars first, but preserve the raw text for processing
+    # We work on a character level so we can escape and then apply markup.
+    # Strategy: tokenise by backtick/asterisk/underscore spans.
+
+    result = []
+    i = 0
+    s = text
+
+    while i < len(s):
+        # inline code: `...`
+        if s[i] == '`':
+            j = s.find('`', i + 1)
+            if j != -1:
+                code = _html.escape(s[i+1:j])
+                result.append(
+                    f'<span font_family="monospace" size="small"'
+                    f' background="#333" foreground="#e8e8e8"> {code} </span>'
+                )
+                i = j + 1
+                continue
+
+        # bold+italic: ***...***
+        if s[i:i+3] == '***':
+            j = s.find('***', i + 3)
+            if j != -1:
+                inner = _html.escape(s[i+3:j])
+                result.append(f'<b><i>{inner}</i></b>')
+                i = j + 3
+                continue
+
+        # bold: **...** or __...__
+        if s[i:i+2] in ('**', '__'):
+            marker = s[i:i+2]
+            j = s.find(marker, i + 2)
+            if j != -1:
+                inner = _html.escape(s[i+2:j])
+                result.append(f'<b>{inner}</b>')
+                i = j + 2
+                continue
+
+        # italic: *...* or _..._
+        if s[i] in ('*', '_'):
+            marker = s[i]
+            j = s.find(marker, i + 1)
+            if j != -1:
+                inner = _html.escape(s[i+1:j])
+                result.append(f'<i>{inner}</i>')
+                i = j + 1
+                continue
+
+        # normal char — escape for Pango XML
+        result.append(_html.escape(s[i]))
+        i += 1
+
+    return "".join(result)
 
 
-def _md_to_html(text: str) -> str:
-    css = _CSS_DARK if _is_dark() else _CSS_LIGHT
-    body = _md(text) if text.strip() else "<p></p>"
-    return (
-        f"<html><head><meta charset='utf-8'>"
-        f"<style>{css}</style></head>"
-        f"<body>{body}</body></html>"
-    )
-
-
-# ── WebView bubble for assistant messages ──────────────────────────────────
-
-_MIN_WV_HEIGHT = 40   # px — prevent zero-height flicker on first load
+# ── Assistant bubble ───────────────────────────────────────────────────────
 
 class AssistantBubble(Gtk.Box):
-    """
-    Full-width assistant bubble backed by a WebKit WebView.
-    Height is auto-sized via JS after each content update.
-    """
+    """Full-width assistant bubble using a non-editable Gtk.TextView."""
 
     def __init__(self, content: str = ""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -92,7 +185,7 @@ class AssistantBubble(Gtk.Box):
         frame.set_hexpand(True)
         self.append(frame)
 
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         inner.set_margin_top(8)
         inner.set_margin_bottom(8)
         inner.set_margin_start(12)
@@ -100,14 +193,16 @@ class AssistantBubble(Gtk.Box):
         inner.set_hexpand(True)
         frame.set_child(inner)
 
-        # WebView — transparent background, no scrollbars
-        self._wv = WebKit.WebView()
-        self._wv.set_hexpand(True)
-        self._wv.set_size_request(-1, _MIN_WV_HEIGHT)
-        self._wv.set_background_color(Gdk.RGBA(0, 0, 0, 0))
-        # Disable context menu & navigation
-        self._wv.connect("decide-policy", lambda wv, d, t: d.ignore())
-        inner.append(self._wv)
+        # TextView — non-editable, no cursor, wraps, full width
+        self._tv = Gtk.TextView()
+        self._tv.set_editable(False)
+        self._tv.set_cursor_visible(False)
+        self._tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._tv.set_hexpand(True)
+        self._tv.set_can_focus(False)
+        # Make background transparent so the card frame shows through
+        self._tv.add_css_class("transparent-textview")
+        inner.append(self._tv)
 
         # Copy button row
         btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -126,37 +221,16 @@ class AssistantBubble(Gtk.Box):
         self._copied_lbl.add_css_class("dim-label")
         btn_row.append(self._copied_lbl)
 
-        # Load initial content
-        self._load_content(content)
+        if content:
+            self.update_content(content)
 
     def update_content(self, content: str):
         self._content = content
-        self._load_content(content)
-
-    def _load_content(self, content: str):
-        html = _md_to_html(content)
-        self._wv.load_html(html, "about:blank")
-        # After load, measure real body height and resize the widget
-        self._wv.connect("load-changed", self._on_load_changed)
-
-    def _on_load_changed(self, wv, event):
-        if event == WebKit.LoadEvent.FINISHED:
-            # Query the document's scroll height via JS and resize
-            wv.evaluate_javascript(
-                "document.body.scrollHeight",
-                -1, None, None, None,
-                self._on_height_result,
-                None,
-            )
-
-    def _on_height_result(self, wv, result, _user_data):
-        try:
-            js_val = wv.evaluate_javascript_finish(result)
-            h = int(js_val.to_double())
-            if h > 0:
-                wv.set_size_request(-1, max(h, _MIN_WV_HEIGHT))
-        except Exception:
-            pass
+        markup = _md_to_pango(content)
+        buf = self._tv.get_buffer()
+        buf.delete(buf.get_start_iter(), buf.get_end_iter())
+        # insert_markup requires start iter
+        buf.insert_markup(buf.get_start_iter(), markup, -1)
 
     def _on_copy(self, _btn):
         clipboard = Gdk.Display.get_default().get_clipboard()
@@ -165,7 +239,7 @@ class AssistantBubble(Gtk.Box):
         GLib.timeout_add(1500, lambda: self._copied_lbl.set_visible(False) or GLib.SOURCE_REMOVE)
 
 
-# ── Plain label bubble for user messages ──────────────────────────────────
+# ── User bubble ────────────────────────────────────────────────────────────
 
 class UserBubble(Gtk.Box):
     def __init__(self, content: str):
@@ -231,6 +305,22 @@ class ChatView(Gtk.Box):
         self._streaming_text = ""
 
         self._build_ui()
+        self._inject_css()
+
+    def _inject_css(self):
+        """Make TextView backgrounds transparent so card styling shows through."""
+        provider = Gtk.CssProvider()
+        provider.load_from_string(
+            "textview.transparent-textview, "
+            "textview.transparent-textview > text { "
+            "  background-color: transparent; "
+            "}"
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
     def _build_ui(self):
         # System prompt expander
@@ -269,6 +359,7 @@ class ChatView(Gtk.Box):
         self._msg_box.set_margin_bottom(16)
         self._msg_box.set_margin_start(16)
         self._msg_box.set_margin_end(16)
+        self._msg_box.set_hexpand(True)
         scroll.set_child(self._msg_box)
 
         self._scroll = scroll
@@ -379,10 +470,7 @@ class ChatView(Gtk.Box):
     # ------------------------------------------------------------------ #
 
     def _add_bubble(self, role: str, content: str):
-        if role == "assistant":
-            bubble = AssistantBubble(content)
-        else:
-            bubble = UserBubble(content)
+        bubble = AssistantBubble(content) if role == "assistant" else UserBubble(content)
         self._msg_box.append(bubble)
         return bubble
 
@@ -393,8 +481,7 @@ class ChatView(Gtk.Box):
         GLib.idle_add(_do)
 
     def _on_key_pressed(self, ctrl, keyval, keycode, state):
-        if keyval == 65293:  # Return
-            from gi.repository import Gdk
+        if keyval == 65293:
             if not (state & Gdk.ModifierType.SHIFT_MASK):
                 self._on_send_clicked(None)
                 return True
