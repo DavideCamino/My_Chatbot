@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "name": "Qwen3 0.6B",
+      "hf_id": "Qwen/Qwen3-0.6B",
+      "description": "Tiny, very fast model for quick tasks"
+    },
+    {
+      "name": "Qwen3 1.7B",
+      "hf_id": "Qwen/Qwen3-1.7B",
+      "description": "Small but capable"
+    },
+    {
+      "name": "Qwen3 4B",
+      "hf_id": "Qwen/Qwen3-4B",
+      "description": "Fast, lightweight model (~2.5 GB)"
+    },
+    {
+      "name": "Qwen3 8B",
+      "hf_id": "Qwen/Qwen3-8B",
+      "description": "Balanced model (~5 GB)"
+    },
+    {
+      "name": "Qwen3 14B",
+      "hf_id": "Qwen/Qwen3-14B",
+      "description": "High-quality model (~9 GB)"
+    }
+  ]
+}
