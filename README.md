@@ -65,8 +65,8 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourname/local-ai-chatbot.git
-cd local-ai-chatbot
+git clone https://github.com/DavideCamino/My_Chatbot.git
+cd My_Chatbot
 
 # 2. Create and activate a virtual environment (recommended)
 python -m venv .venv
