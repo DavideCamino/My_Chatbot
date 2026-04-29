@@ -43,13 +43,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._build_ui()
         self._connect_model_manager()
 
-        # Load last-used model on startup if set
+        # Load last-used model on startup and sync the dropdown
         last = settings.last_model
+        models = self._model_mgr.get_available_models()
+        preselect = 0
+        if last:
+            for i, m in enumerate(models):
+                if m.hf_id == last:
+                    preselect = i
+                    break
+        # Block the signal while we set the initial value so it doesn't trigger a load
+        self._model_dropdown.handler_block_by_func(self._on_model_selected)
+        self._model_dropdown.set_selected(preselect)
+        self._model_dropdown.handler_unblock_by_func(self._on_model_selected)
         if last and self._model_mgr.is_model_cached(last):
             self._model_mgr.load_model_async(last)
-        elif self._model_mgr.get_available_models():
-            # Pre-select first model in dropdown without loading
-            self._model_dropdown.set_selected(0)
 
         # Open most recent chat or create a new one
         chats = ChatStore.list_chats()
@@ -101,6 +109,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sidebar.on_new_chat = self._create_new_chat
         self._sidebar.on_delete_chat = self._confirm_delete_chat
         self._sidebar.on_rename_chat = self._do_rename_chat
+        self._sidebar.on_delete_many = self._do_delete_many
 
         sidebar_page = Adw.NavigationPage(title="Chats")
         sidebar_page.set_child(self._sidebar)
@@ -266,6 +275,19 @@ class MainWindow(Adw.ApplicationWindow):
             if self._chat and self._chat.id == chat_id:
                 self._chat.title = new_title
                 self._title_label.set_label(new_title)
+
+    def _do_delete_many(self, ids: list):
+        current_deleted = self._chat and self._chat.id in ids
+        for chat_id in ids:
+            ChatStore.delete_chat(chat_id)
+            self._sidebar.remove_chat(chat_id)
+        if current_deleted:
+            self._chat = None
+            chats = ChatStore.list_chats()
+            if chats:
+                self._open_chat(chats[0].id)
+            else:
+                self._create_new_chat()
 
     def _do_delete_chat(self, chat_id: str):
         ChatStore.delete_chat(chat_id)
