@@ -34,13 +34,13 @@ A fully offline, privacy-first AI chatbot for the GNOME desktop. Built with GTK4
 
 ```bash
 # Debian / Ubuntu
-sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtksource-5
 
 # Fedora
-sudo dnf install python3-gobject gtk4 libadwaita
+sudo dnf install python3-gobject gtk4 libadwaita gtksourceview5
 
 # Arch
-sudo pacman -S python-gobject gtk4 libadwaita
+sudo pacman -S python-gobject gtk4 libadwaita gtksourceview5
 ```
 
 ### Python packages
@@ -65,8 +65,8 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/DavideCamino/My_Chatbot.git
-cd My_Chatbot
+git clone https://github.com/yourname/local-ai-chatbot.git
+cd local-ai-chatbot
 
 # 2. Create and activate a virtual environment (recommended)
 python -m venv .venv
@@ -175,5 +175,4 @@ huggingface-cli download Qwen/Qwen3-4B
 MIT — see `LICENSE` for details.
 
 ## TO DO
-- Il codice in markdown viene visualizzato solo dopo averlo scritto tutto, vorrei che si vedesse durante la generazione
 - Schermata di impostazioni avanzate per controllare temperatura e altri parametri

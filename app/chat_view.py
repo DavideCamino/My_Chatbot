@@ -17,7 +17,11 @@ Dependencies: pip install mistune  (only used for inline markdown in text segmen
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, Gdk, GLib, Pango
+gi.require_version("GtkSource", "5")
+from gi.repository import Gtk, Adw, Gdk, GLib, Pango, GtkSource
+
+# Initialise GtkSourceView (required before using any GtkSource API)
+GtkSource.init()
 
 import html as _html
 import re
@@ -148,19 +152,72 @@ def _parse_segments(raw: str) -> List:
     return segments
 
 
+# ── Language ID mapping ───────────────────────────────────────────────────
+# Maps common markdown fence hints to GtkSourceView language IDs.
+
+_LANG_MAP = {
+    "py": "python", "python": "python",
+    "js": "js", "javascript": "js", "ts": "typescript", "typescript": "typescript",
+    "sh": "sh", "bash": "sh", "shell": "sh", "zsh": "sh",
+    "c": "c", "cpp": "cpp", "c++": "cpp", "h": "c",
+    "cs": "c-sharp", "csharp": "c-sharp",
+    "java": "java", "kotlin": "kotlin",
+    "rs": "rust", "rust": "rust",
+    "go": "go",
+    "rb": "ruby", "ruby": "ruby",
+    "php": "php",
+    "html": "html", "xml": "xml", "css": "css", "scss": "css",
+    "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml",
+    "sql": "sql",
+    "md": "markdown", "markdown": "markdown",
+    "r": "r",
+    "swift": "swift",
+    "lua": "lua",
+    "dockerfile": "dockerfile",
+    "makefile": "makefile",
+}
+
+_LANG_MANAGER = GtkSource.LanguageManager.get_default()
+_STYLE_MANAGER = GtkSource.StyleSchemeManager.get_default()
+
+
+def _get_source_language(hint: str):
+    """Return a GtkSource.Language for the given fence hint, or None."""
+    lid = _LANG_MAP.get(hint.lower(), hint.lower())
+    return _LANG_MANAGER.get_language(lid)
+
+
+def _get_style_scheme(dark: bool) -> GtkSource.StyleScheme:
+    """Pick a built-in style scheme appropriate for the current theme."""
+    # Prefer Adwaita variants if available, fall back to classic schemes.
+    if dark:
+        for name in ("Adwaita-dark", "oblivion", "cobalt", "kate-dark"):
+            s = _STYLE_MANAGER.get_scheme(name)
+            if s:
+                return s
+    else:
+        for name in ("Adwaita", "classic", "tango"):
+            s = _STYLE_MANAGER.get_scheme(name)
+            if s:
+                return s
+    return _STYLE_MANAGER.get_scheme("classic")
+
+
 # ── CodeBlock widget ──────────────────────────────────────────────────────
 
 class CodeBlock(Gtk.Box):
     """
-    A dark rounded box containing:
-      • top bar: language label  +  Copy button
-      • monospace TextView with the code
+    A rounded box with:
+      • top bar: language label + Copy button
+      • GtkSource.View for syntax-highlighted, non-editable code
     """
+
     def __init__(self, lang: str, code: str):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_hexpand(True)
         self.add_css_class("code-block-box")
         self._code = code
+        self._lang_hint = lang
 
         # ── Top bar ──────────────────────────────────────────────
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -174,7 +231,6 @@ class CodeBlock(Gtk.Box):
         lang_lbl = Gtk.Label(label=lang or "code")
         lang_lbl.set_xalign(0)
         lang_lbl.set_hexpand(True)
-        lang_lbl.add_css_class("dim-label")
         lang_lbl.set_css_classes(["caption", "dim-label"])
         top.append(lang_lbl)
 
@@ -190,41 +246,47 @@ class CodeBlock(Gtk.Box):
         self._copied_lbl.add_css_class("dim-label")
         top.append(self._copied_lbl)
 
-        # ── Separator ────────────────────────────────────────────
         self.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # ── Code TextView ────────────────────────────────────────
+        # ── GtkSource.View ────────────────────────────────────────
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         scroll.set_hexpand(True)
         self.append(scroll)
 
-        self._tv = Gtk.TextView()
-        self._tv.set_editable(False)
-        self._tv.set_cursor_visible(False)
-        self._tv.set_wrap_mode(Gtk.WrapMode.NONE)   # horizontal scroll for long lines
-        self._tv.set_hexpand(True)
-        self._tv.set_can_focus(False)
-        self._tv.set_top_margin(10)
-        self._tv.set_bottom_margin(10)
-        self._tv.set_left_margin(12)
-        self._tv.set_right_margin(12)
-        self._tv.add_css_class("code-block-textview")
-        scroll.set_child(self._tv)
+        # GtkSource.Buffer — attach language for highlighting
+        self._buf = GtkSource.Buffer()
+        src_lang = _get_source_language(lang)
+        if src_lang:
+            self._buf.set_language(src_lang)
+        self._buf.set_highlight_syntax(True)
 
-        # Apply monospace tag
-        buf = self._tv.get_buffer()
-        self._mono_tag = buf.create_tag("mono", family="monospace", size_points=12)
+        dark = Gtk.Settings.get_default().get_property("gtk-application-prefer-dark-theme")
+        scheme = _get_style_scheme(dark)
+        if scheme:
+            self._buf.set_style_scheme(scheme)
+
+        self._sv = GtkSource.View.new_with_buffer(self._buf)
+        self._sv.set_editable(False)
+        self._sv.set_cursor_visible(False)
+        self._sv.set_wrap_mode(Gtk.WrapMode.NONE)
+        self._sv.set_hexpand(True)
+        self._sv.set_can_focus(False)
+        self._sv.set_top_margin(10)
+        self._sv.set_bottom_margin(10)
+        self._sv.set_left_margin(12)
+        self._sv.set_right_margin(12)
+        self._sv.set_show_line_numbers(True)
+        self._sv.set_monospace(True)
+        self._sv.add_css_class("code-block-sourceview")
+        scroll.set_child(self._sv)
 
         self.set_code(code)
 
     def set_code(self, code: str):
         self._code = code
-        buf = self._tv.get_buffer()
-        buf.set_text(code)
-        start = buf.get_start_iter()
-        end = buf.get_end_iter()
-        buf.apply_tag(self._mono_tag, start, end)
+        # Preserve cursor/scroll position — just replace text
+        self._buf.set_text(code, -1)
 
     def _on_copy(self, _btn):
         clipboard = Gdk.Display.get_default().get_clipboard()
@@ -430,18 +492,17 @@ class ChatView(Gtk.Box):
                 background-color: transparent;
             }
             .code-block-box {
-                background-color: #1e1e2e;
                 border-radius: 8px;
+                border: 1px solid alpha(currentColor, 0.15);
             }
             .code-block-topbar {
-                background-color: #2a2a3e;
                 border-radius: 8px 8px 0 0;
             }
-            textview.code-block-textview,
-            textview.code-block-textview > text {
-                background-color: #1e1e2e;
-                color: #cdd6f4;
+            textview.code-block-sourceview,
+            textview.code-block-sourceview > text {
                 border-radius: 0 0 8px 8px;
+                font-family: monospace;
+                font-size: 12pt;
             }
         """)
         Gtk.StyleContext.add_provider_for_display(
