@@ -1,11 +1,17 @@
 """
 ChatView — the right-hand message area.
 
-User bubbles:     plain Gtk.Label (right-aligned).
-Assistant bubbles: Gtk.TextView with Pango markup rendered from markdown.
-                   Full-width, stable during streaming, no WebKit needed.
+Rendering strategy
+------------------
+Each assistant message is split into alternating segments:
+  • TextSegment  — rendered with a Gtk.TextView + Pango markup (markdown)
+  • CodeSegment  — rendered with a monospace Gtk.TextView inside a dark
+                   rounded box, with a language label and a Copy button.
 
-Extra dependency: pip install mistune
+Segments are rebuilt from scratch on every token during streaming,
+so code blocks appear and grow in real time just like normal text.
+
+Dependencies: pip install mistune  (only used for inline markdown in text segments)
 """
 
 import gi
@@ -15,114 +21,19 @@ from gi.repository import Gtk, Adw, Gdk, GLib, Pango
 
 import html as _html
 import re
+from dataclasses import dataclass, field
+from typing import List
 
 from app.chat_store import Chat, Message
 
 
-# ── Markdown → Pango markup ────────────────────────────────────────────────
-# We do a lightweight manual conversion rather than mistune so there are
-# zero extra dependencies and the result maps cleanly to Pango tags.
-
-def _md_to_pango(text: str) -> str:
-    """
-    Convert a small but practical subset of Markdown to Pango markup.
-    Handles: headings, bold, italic, inline code, code blocks,
-             unordered lists, ordered lists, blockquotes, horizontal rules.
-    """
-    lines = text.split("\n")
-    out = []
-    in_code_block = False
-    code_buf = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-
-        # ── fenced code block ──────────────────────────────────────
-        if line.startswith("```"):
-            if not in_code_block:
-                in_code_block = True
-                code_buf = []
-            else:
-                in_code_block = False
-                code = "\n".join(code_buf)
-                escaped = _html.escape(code)
-                out.append(
-                    f'<span font_family="monospace" size="small" '
-                    f'background="#2a2a2a" foreground="#e0e0e0"> {escaped} </span>'
-                )
-            i += 1
-            continue
-
-        if in_code_block:
-            code_buf.append(line)
-            i += 1
-            continue
-
-        # ── headings ───────────────────────────────────────────────
-        m = re.match(r"^(#{1,3})\s+(.*)", line)
-        if m:
-            level = len(m.group(1))
-            sizes = {1: "x-large", 2: "large", 3: "medium"}
-            content = _inline_md(m.group(2))
-            out.append(f'<span size="{sizes[level]}" weight="bold">{content}</span>')
-            i += 1
-            continue
-
-        # ── horizontal rule ────────────────────────────────────────
-        if re.match(r"^[-*_]{3,}\s*$", line):
-            out.append('<span foreground="#888">────────────────────</span>')
-            i += 1
-            continue
-
-        # ── blockquote ─────────────────────────────────────────────
-        if line.startswith("> "):
-            content = _inline_md(line[2:])
-            out.append(f'<span foreground="#888">┃ {content}</span>')
-            i += 1
-            continue
-
-        # ── unordered list ─────────────────────────────────────────
-        m = re.match(r"^[\-\*\+]\s+(.*)", line)
-        if m:
-            content = _inline_md(m.group(1))
-            out.append(f"  • {content}")
-            i += 1
-            continue
-
-        # ── ordered list ───────────────────────────────────────────
-        m = re.match(r"^(\d+)\.\s+(.*)", line)
-        if m:
-            content = _inline_md(m.group(2))
-            out.append(f"  {m.group(1)}. {content}")
-            i += 1
-            continue
-
-        # ── blank line ─────────────────────────────────────────────
-        if line.strip() == "":
-            out.append("")
-            i += 1
-            continue
-
-        # ── normal paragraph line ──────────────────────────────────
-        out.append(_inline_md(line))
-        i += 1
-
-    return "\n".join(out)
-
+# ── Markdown inline → Pango markup (text segments only) ──────────────────
 
 def _inline_md(text: str) -> str:
-    """Apply inline markdown (bold, italic, inline code) to a single line."""
-    # Escape XML special chars first, but preserve the raw text for processing
-    # We work on a character level so we can escape and then apply markup.
-    # Strategy: tokenise by backtick/asterisk/underscore spans.
-
     result = []
     i = 0
     s = text
-
     while i < len(s):
-        # inline code: `...`
         if s[i] == '`':
             j = s.find('`', i + 1)
             if j != -1:
@@ -133,87 +44,240 @@ def _inline_md(text: str) -> str:
                 )
                 i = j + 1
                 continue
-
-        # bold+italic: ***...***
         if s[i:i+3] == '***':
             j = s.find('***', i + 3)
             if j != -1:
-                inner = _html.escape(s[i+3:j])
-                result.append(f'<b><i>{inner}</i></b>')
+                result.append(f'<b><i>{_html.escape(s[i+3:j])}</i></b>')
                 i = j + 3
                 continue
-
-        # bold: **...** or __...__
         if s[i:i+2] in ('**', '__'):
             marker = s[i:i+2]
             j = s.find(marker, i + 2)
             if j != -1:
-                inner = _html.escape(s[i+2:j])
-                result.append(f'<b>{inner}</b>')
+                result.append(f'<b>{_html.escape(s[i+2:j])}</b>')
                 i = j + 2
                 continue
-
-        # italic: *...* or _..._
         if s[i] in ('*', '_'):
             marker = s[i]
             j = s.find(marker, i + 1)
             if j != -1:
-                inner = _html.escape(s[i+1:j])
-                result.append(f'<i>{inner}</i>')
+                result.append(f'<i>{_html.escape(s[i+1:j])}</i>')
                 i = j + 1
                 continue
-
-        # normal char — escape for Pango XML
         result.append(_html.escape(s[i]))
         i += 1
-
     return "".join(result)
 
 
-# ── Assistant bubble ───────────────────────────────────────────────────────
+def _line_to_pango(line: str) -> str:
+    """Convert one markdown line to a Pango markup string."""
+    m = re.match(r"^(#{1,3})\s+(.*)", line)
+    if m:
+        sizes = {1: "x-large", 2: "large", 3: "medium"}
+        return f'<span size="{sizes[len(m.group(1))]}" weight="bold">{_inline_md(m.group(2))}</span>'
+    if re.match(r"^[-*_]{3,}\s*$", line):
+        return '<span foreground="#888">────────────────────</span>'
+    if line.startswith("> "):
+        return f'<span foreground="#888">┃ {_inline_md(line[2:])}</span>'
+    m = re.match(r"^[\-\*\+]\s+(.*)", line)
+    if m:
+        return f"  • {_inline_md(m.group(1))}"
+    m = re.match(r"^(\d+)\.\s+(.*)", line)
+    if m:
+        return f"  {m.group(1)}. {_inline_md(m.group(2))}"
+    return _inline_md(line)
+
+
+def _text_to_pango(text: str) -> str:
+    return "\n".join(_line_to_pango(l) for l in text.split("\n"))
+
+
+# ── Segment dataclasses ───────────────────────────────────────────────────
+
+@dataclass
+class TextSeg:
+    text: str = ""          # raw markdown text
+
+@dataclass
+class CodeSeg:
+    lang: str = ""          # language hint (may be empty)
+    code: str = ""          # code content (may be partial / no closing ```)
+    closed: bool = False    # True once the closing ``` has been seen
+
+
+def _parse_segments(raw: str) -> List:
+    """
+    Split raw markdown into alternating TextSeg / CodeSeg objects.
+    Works on partial input (no closing ``` required).
+    """
+    segments: List = []
+    cur_text = []
+    lines = raw.split("\n")
+    in_code = False
+    lang = ""
+    cur_code: List[str] = []
+
+    for line in lines:
+        if not in_code:
+            if line.startswith("```"):
+                # flush text
+                if cur_text:
+                    segments.append(TextSeg("\n".join(cur_text)))
+                    cur_text = []
+                lang = line[3:].strip()
+                in_code = True
+                cur_code = []
+            else:
+                cur_text.append(line)
+        else:
+            if line.startswith("```"):
+                segments.append(CodeSeg(lang=lang, code="\n".join(cur_code), closed=True))
+                in_code = False
+                lang = ""
+                cur_code = []
+            else:
+                cur_code.append(line)
+
+    # flush remaining
+    if in_code:
+        # partial (unclosed) code block — still show it
+        segments.append(CodeSeg(lang=lang, code="\n".join(cur_code), closed=False))
+    elif cur_text:
+        segments.append(TextSeg("\n".join(cur_text)))
+
+    return segments
+
+
+# ── CodeBlock widget ──────────────────────────────────────────────────────
+
+class CodeBlock(Gtk.Box):
+    """
+    A dark rounded box containing:
+      • top bar: language label  +  Copy button
+      • monospace TextView with the code
+    """
+    def __init__(self, lang: str, code: str):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_hexpand(True)
+        self.add_css_class("code-block-box")
+        self._code = code
+
+        # ── Top bar ──────────────────────────────────────────────
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        top.add_css_class("code-block-topbar")
+        top.set_margin_start(10)
+        top.set_margin_end(6)
+        top.set_margin_top(4)
+        top.set_margin_bottom(4)
+        self.append(top)
+
+        lang_lbl = Gtk.Label(label=lang or "code")
+        lang_lbl.set_xalign(0)
+        lang_lbl.set_hexpand(True)
+        lang_lbl.add_css_class("dim-label")
+        lang_lbl.set_css_classes(["caption", "dim-label"])
+        top.append(lang_lbl)
+
+        self._copy_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic")
+        self._copy_btn.set_tooltip_text("Copy code")
+        self._copy_btn.add_css_class("flat")
+        self._copy_btn.add_css_class("circular")
+        self._copy_btn.connect("clicked", self._on_copy)
+        top.append(self._copy_btn)
+
+        self._copied_lbl = Gtk.Label(label="Copied!")
+        self._copied_lbl.set_visible(False)
+        self._copied_lbl.add_css_class("dim-label")
+        top.append(self._copied_lbl)
+
+        # ── Separator ────────────────────────────────────────────
+        self.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # ── Code TextView ────────────────────────────────────────
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        scroll.set_hexpand(True)
+        self.append(scroll)
+
+        self._tv = Gtk.TextView()
+        self._tv.set_editable(False)
+        self._tv.set_cursor_visible(False)
+        self._tv.set_wrap_mode(Gtk.WrapMode.NONE)   # horizontal scroll for long lines
+        self._tv.set_hexpand(True)
+        self._tv.set_can_focus(False)
+        self._tv.set_top_margin(10)
+        self._tv.set_bottom_margin(10)
+        self._tv.set_left_margin(12)
+        self._tv.set_right_margin(12)
+        self._tv.add_css_class("code-block-textview")
+        scroll.set_child(self._tv)
+
+        # Apply monospace tag
+        buf = self._tv.get_buffer()
+        self._mono_tag = buf.create_tag("mono", family="monospace", size_points=12)
+
+        self.set_code(code)
+
+    def set_code(self, code: str):
+        self._code = code
+        buf = self._tv.get_buffer()
+        buf.set_text(code)
+        start = buf.get_start_iter()
+        end = buf.get_end_iter()
+        buf.apply_tag(self._mono_tag, start, end)
+
+    def _on_copy(self, _btn):
+        clipboard = Gdk.Display.get_default().get_clipboard()
+        clipboard.set(self._code)
+        self._copied_lbl.set_visible(True)
+        GLib.timeout_add(1500, lambda: self._copied_lbl.set_visible(False) or GLib.SOURCE_REMOVE)
+
+
+# ── AssistantBubble ───────────────────────────────────────────────────────
 
 class AssistantBubble(Gtk.Box):
-    """Full-width assistant bubble using a non-editable Gtk.TextView."""
+    """
+    Full-width assistant bubble.
 
+    Segments are updated IN PLACE to avoid layout glitching:
+    - Existing TextSegment TextViews have their buffer replaced.
+    - Existing CodeBlock widgets have set_code() called.
+    - New widgets are only appended when the segment count grows.
+    - Widgets are never removed during streaming.
+    """
     def __init__(self, content: str = ""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.set_hexpand(True)
         self._content = content
+        # Parallel list of live widgets matching the last parsed segments
+        self._seg_widgets: list = []   # Gtk.TextView | CodeBlock
 
-        frame = Gtk.Frame()
-        frame.add_css_class("card")
-        frame.set_hexpand(True)
-        self.append(frame)
+        outer_frame = Gtk.Frame()
+        outer_frame.add_css_class("card")
+        outer_frame.set_hexpand(True)
+        self.append(outer_frame)
 
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        inner.set_margin_top(8)
-        inner.set_margin_bottom(8)
-        inner.set_margin_start(12)
-        inner.set_margin_end(12)
-        inner.set_hexpand(True)
-        frame.set_child(inner)
+        self._outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._outer.set_margin_top(8)
+        self._outer.set_margin_bottom(4)
+        self._outer.set_margin_start(12)
+        self._outer.set_margin_end(12)
+        self._outer.set_hexpand(True)
+        outer_frame.set_child(self._outer)
 
-        # TextView — non-editable, no cursor, wraps, full width
-        self._tv = Gtk.TextView()
-        self._tv.set_editable(False)
-        self._tv.set_cursor_visible(False)
-        self._tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._tv.set_hexpand(True)
-        self._tv.set_can_focus(False)
-        # Make background transparent so the card frame shows through
-        self._tv.add_css_class("transparent-textview")
-        inner.append(self._tv)
+        self._seg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._seg_box.set_hexpand(True)
+        self._outer.append(self._seg_box)
 
-        # Copy button row
         btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         btn_row.set_halign(Gtk.Align.END)
-        inner.append(btn_row)
+        self._outer.append(btn_row)
 
         copy_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic")
-        copy_btn.set_tooltip_text("Copy")
+        copy_btn.set_tooltip_text("Copy full response")
         copy_btn.add_css_class("flat")
         copy_btn.add_css_class("circular")
-        copy_btn.connect("clicked", self._on_copy)
+        copy_btn.connect("clicked", self._on_copy_all)
         btn_row.append(copy_btn)
 
         self._copied_lbl = Gtk.Label(label="Copied!")
@@ -224,22 +288,74 @@ class AssistantBubble(Gtk.Box):
         if content:
             self.update_content(content)
 
+    # ------------------------------------------------------------------ #
+
     def update_content(self, content: str):
         self._content = content
-        markup = _md_to_pango(content)
-        buf = self._tv.get_buffer()
+        segments = _parse_segments(content)
+
+        for i, seg in enumerate(segments):
+            if i < len(self._seg_widgets):
+                # Update existing widget in place
+                w = self._seg_widgets[i]
+                if isinstance(seg, TextSeg) and isinstance(w, Gtk.TextView):
+                    self._set_textview(w, seg.text)
+                elif isinstance(seg, CodeSeg) and isinstance(w, CodeBlock):
+                    w.set_code(seg.code)
+                else:
+                    # Segment type changed (shouldn't happen mid-stream, but handle it)
+                    self._seg_box.remove(w)
+                    new_w = self._make_widget(seg)
+                    # Insert at position i: append all then re-insert is complex in GTK4,
+                    # so just replace via remove + append (only happens on type switch)
+                    self._seg_widgets[i] = new_w
+                    self._seg_box.append(new_w)
+            else:
+                # New segment — append a fresh widget
+                w = self._make_widget(seg)
+                self._seg_widgets.append(w)
+                self._seg_box.append(w)
+
+        # If the segment count shrank (shouldn't during streaming, but be safe)
+        while len(self._seg_widgets) > len(segments):
+            w = self._seg_widgets.pop()
+            self._seg_box.remove(w)
+
+    # ------------------------------------------------------------------ #
+
+    def _make_widget(self, seg):
+        if isinstance(seg, TextSeg):
+            tv = self._new_textview()
+            self._set_textview(tv, seg.text)
+            return tv
+        else:
+            return CodeBlock(seg.lang, seg.code)
+
+    def _new_textview(self) -> Gtk.TextView:
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_cursor_visible(False)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_hexpand(True)
+        tv.set_can_focus(False)
+        tv.add_css_class("transparent-textview")
+        return tv
+
+    def _set_textview(self, tv: Gtk.TextView, text: str):
+        """Replace the buffer content of an existing TextView without recreating it."""
+        buf = tv.get_buffer()
         buf.delete(buf.get_start_iter(), buf.get_end_iter())
-        # insert_markup requires start iter
+        markup = _text_to_pango(text)
         buf.insert_markup(buf.get_start_iter(), markup, -1)
 
-    def _on_copy(self, _btn):
+    def _on_copy_all(self, _btn):
         clipboard = Gdk.Display.get_default().get_clipboard()
         clipboard.set(self._content)
         self._copied_lbl.set_visible(True)
         GLib.timeout_add(1500, lambda: self._copied_lbl.set_visible(False) or GLib.SOURCE_REMOVE)
 
 
-# ── User bubble ────────────────────────────────────────────────────────────
+# ── UserBubble ────────────────────────────────────────────────────────────
 
 class UserBubble(Gtk.Box):
     def __init__(self, content: str):
@@ -292,12 +408,11 @@ class UserBubble(Gtk.Box):
         GLib.timeout_add(1500, lambda: self._copied_lbl.set_visible(False) or GLib.SOURCE_REMOVE)
 
 
-# ── Main ChatView ──────────────────────────────────────────────────────────
+# ── ChatView ──────────────────────────────────────────────────────────────
 
 class ChatView(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-
         self._chat: Chat | None = None
         self._on_send = None
         self._on_stop = None
@@ -308,14 +423,27 @@ class ChatView(Gtk.Box):
         self._inject_css()
 
     def _inject_css(self):
-        """Make TextView backgrounds transparent so card styling shows through."""
         provider = Gtk.CssProvider()
-        provider.load_from_string(
-            "textview.transparent-textview, "
-            "textview.transparent-textview > text { "
-            "  background-color: transparent; "
-            "}"
-        )
+        provider.load_from_string("""
+            textview.transparent-textview,
+            textview.transparent-textview > text {
+                background-color: transparent;
+            }
+            .code-block-box {
+                background-color: #1e1e2e;
+                border-radius: 8px;
+            }
+            .code-block-topbar {
+                background-color: #2a2a3e;
+                border-radius: 8px 8px 0 0;
+            }
+            textview.code-block-textview,
+            textview.code-block-textview > text {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+                border-radius: 0 0 8px 8px;
+            }
+        """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
@@ -415,13 +543,10 @@ class ChatView(Gtk.Box):
             nxt = child.get_next_sibling()
             self._msg_box.remove(child)
             child = nxt
-
         buf = self._system_prompt_view.get_buffer()
         buf.set_text(chat.system_prompt)
-
         for msg in chat.messages:
             self._add_bubble(msg.role, msg.content)
-
         self._scroll_to_bottom()
 
     def append_user_message(self, text: str):
